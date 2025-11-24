@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Dashboard Penyiram - MQTT</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;max-width:920px;margin:18px auto;padding:12px}
+    h1{font-size:20px;margin-bottom:8px}
+    .card{border:1px solid #ddd;border-radius:6px;padding:12px;margin-bottom:12px;box-shadow:0 1px 0 rgba(0,0,0,0.03)}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .col{flex:1 1 220px;min-width:220px}
+    label{display:block;font-size:12px;color:#333;margin-bottom:6px}
+    input[type="text"], input[type="number"]{width:100%;padding:8px;border:1px solid #ccc;border-radius:4px}
+    button{padding:8px 10px;border-radius:6px;border:0;background:#007bff;color:white;cursor:pointer}
+    button.secondary{background:#6c757d}
+    pre{background:#f5f5f5;padding:8px;border-radius:4px;max-height:200px;overflow:auto}
+    .status-green{color:green;font-weight:600}
+    .status-red{color:crimson;font-weight:700}
+    .small{font-size:12px;color:#666}
+  </style>
+</head>
+<body>
+  <h1>Dashboard Penyiram (ESP32) — MQTT</h1>
+
+  <div class="card row">
+    <div class="col">
+      <label>MQTT Broker (ubah jika perlu)</label>
+      <input id="brokerUrl" type="text" value="wss://broker.hivemq.com:8884/mqtt" />
+      <div class="small">Gunakan <code>wss://</code> jika web di-serve lewat HTTPS (GitHub Pages).</div>
+    </div>
+
+    <div class="col">
+      <label>Client ID (opsional)</label>
+      <input id="clientId" type="text" value="web_dash_ESP32_01" />
+    </div>
+
+    <div class="col" style="align-self:end">
+      <button id="connectBtn">Connect MQTT</button>
+      <button id="disconnectBtn" class="secondary">Disconnect</button>
+    </div>
+  </div>
+
+  <div class="card row">
+    <div class="col">
+      <h3>Sensor</h3>
+      <div>Raw: <span id="rawVal">-</span></div>
+      <div>Percent: <span id="percentVal">-</span> %</div>
+      <div>Jumlah Siram Hari: <span id="countVal">-</span></div>
+      <div class="small">Topic sensor: <code>kebun/sensor/kelembapan</code></div>
+    </div>
+
+    <div class="col">
+      <h3>Pompa & Mode</h3>
+      <div>Pompa: <span id="pumpStatus" class="status-red">OFF</span></div>
+      <div>Mode: <span id="modeStatus">AUTO</span></div>
+      <div style="margin-top:8px">
+        <button id="btnPumpOn">POMPA ON</button>
+        <button id="btnPumpOff" class="secondary">POMPA OFF</button>
+      </div>
+      <div style="margin-top:8px">
+        <button id="btnModeAuto">Set AUTO</button>
+        <button id="btnModeManual" class="secondary">Set MANUAL</button>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>Kalibrasi / Threshold</h3>
+      <label>Kalibrasi (dry,wet raw) — contoh: 2100,900</label>
+      <input id="kalibInput" type="text" value="2100,900" />
+      <button id="btnKalib">Kirim Kalibrasi</button>
+
+      <label style="margin-top:8px">Threshold (%)</label>
+      <input id="thresholdInput" type="number" min="0" max="100" value="40" />
+      <button id="btnThreshold">Set Threshold</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Warnings & Log</h3>
+    <div id="warningArea" class="small"></div>
+    <pre id="logArea">-- Log kosong --</pre>
+  </div>
+
+  <!-- mqtt.js dari CDN -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <script>
+    // ========== TOPICS (sesuaikan dengan sketch ESP32) ==========
+    const TOPIC_SENSOR = "kebun/sensor/kelembapan";
+    const TOPIC_POMPA_CTRL = "kebun/control/pompa";
+    const TOPIC_POMPA_STAT = "kebun/status/pompa";
+    const TOPIC_KALIB = "kebun/control/kalibrasi";
+    const TOPIC_THRESHOLD = "kebun/control/threshold";
+    const TOPIC_MODE = "kebun/control/mode";
+    const TOPIC_WARNING = "kebun/status/warning";
+    const TOPIC_LOG = "kebun/log/kelembapan";
+    const TOPIC_HEARTBEAT = "kebun/status/heartbeat";
+
+    // ========== UI elements ==========
+    const rawVal = document.getElementById('rawVal');
+    const percentVal = document.getElementById('percentVal');
+    const countVal = document.getElementById('countVal');
+    const pumpStatus = document.getElementById('pumpStatus');
+    const modeStatus = document.getElementById('modeStatus');
+    const warningArea = document.getElementById('warningArea');
+    const logArea = document.getElementById('logArea');
+
+    const brokerUrlInput = document.getElementById('brokerUrl');
+    const clientIdInput = document.getElementById('clientId');
+    const connectBtn = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+
+    const btnPumpOn = document.getElementById('btnPumpOn');
+    const btnPumpOff = document.getElementById('btnPumpOff');
+    const btnModeAuto = document.getElementById('btnModeAuto');
+    const btnModeManual = document.getElementById('btnModeManual');
+    const kalibInput = document.getElementById('kalibInput');
+    const btnKalib = document.getElementById('btnKalib');
+    const thresholdInput = document.getElementById('thresholdInput');
+    const btnThreshold = document.getElementById('btnThreshold');
+
+    let client = null;
+    let connected = false;
+
+    function appendLog(txt) {
+      const now = new Date().toLocaleString();
+      logArea.textContent = `[${now}] ${txt}\n` + logArea.textContent;
+    }
+
+    function setWarning(txt) {
+      warningArea.textContent = txt;
+      appendLog("WARNING: " + txt);
+    }
+
+    // ===== connect / disconnect =====
+    function connectMQTT() {
+      if (connected && client) return;
+      const broker = brokerUrlInput.value.trim();
+      const clientId = clientIdInput.value.trim() || ("web_" + Math.random().toString(16).substr(2,8));
+      appendLog("Connecting to " + broker + " as " + clientId);
+
+      try {
+        client = mqtt.connect(broker, { clientId: clientId, keepalive: 30, reconnectPeriod: 3000 });
+      } catch(e) {
+        appendLog("CONNECT ERR: " + e);
+        setWarning("Gagal inisialisasi client");
+        return;
+      }
+
+      client.on('connect', function() {
+        connected = true;
+        appendLog("MQTT connected");
+        // subscribe
+        client.subscribe(TOPIC_SENSOR);
+        client.subscribe(TOPIC_POMPA_STAT);
+        client.subscribe(TOPIC_WARNING);
+        client.subscribe(TOPIC_LOG);
+        client.subscribe(TOPIC_HEARTBEAT);
+        appendLog("Subscribed to topics");
+      });
+
+      client.on('reconnect', function() { appendLog("MQTT reconnecting..."); });
+      client.on('close', function() { connected = false; appendLog("MQTT closed"); });
+      client.on('error', function(err) { appendLog("MQTT ERR: " + err); });
+      client.on('message', function(topic, payload) {
+        const s = payload.toString();
+        appendLog(topic + " ⟶ " + s);
+        try {
+          if (topic === TOPIC_SENSOR) {
+            // expect json: {"raw":1234,"percent":40}
+            const j = JSON.parse(s);
+            rawVal.textContent = j.raw ?? rawVal.textContent;
+            percentVal.textContent = j.percent ?? percentVal.textContent;
+          } else if (topic === TOPIC_POMPA_STAT) {
+            if (s === "1" || s === "ON") {
+              pumpStatus.textContent = "ON"; pumpStatus.className = "status-green";
+            } else {
+              pumpStatus.textContent = "OFF"; pumpStatus.className = "status-red";
+            }
+          } else if (topic === TOPIC_WARNING) {
+            setWarning(s);
+          } else if (topic === TOPIC_LOG) {
+            // optional parse count if present
+            try {
+              const j = JSON.parse(s);
+              if (j.count !== undefined) countVal.textContent = j.count;
+            } catch(e){}
+          } else if (topic === TOPIC_HEARTBEAT) {
+            appendLog("Heartbeat: " + s);
+          }
+        } catch(e) {
+          appendLog("Message parse error: " + e);
+        }
+      });
+    }
+
+    function disconnectMQTT() {
+      if (client) client.end(true, () => appendLog("Client disconnected"));
+      client = null; connected = false;
+    }
+
+    // ===== actions =====
+    btnPumpOn.addEventListener('click', () => {
+      if (!client || !connected) { setWarning("MQTT belum terhubung"); return; }
+      client.publish(TOPIC_POMPA_CTRL, "ON");
+      appendLog("Publish: POMPA ON");
+    });
+
+    btnPumpOff.addEventListener('click', () => {
+      if (!client || !connected) { setWarning("MQTT belum terhubung"); return; }
+      client.publish(TOPIC_POMPA_CTRL, "OFF");
+      appendLog("Publish: POMPA OFF");
+    });
+
+    btnModeAuto.addEventListener('click', () => {
+      if (!client || !connected) { setWarning("MQTT belum terhubung"); return; }
+      client.publish(TOPIC_MODE, "AUTO");
+      modeStatus.textContent = "AUTO";
+      appendLog("Set mode AUTO");
+    });
+
+    btnModeManual.addEventListener('click', () => {
+      if (!client || !connected) { setWarning("MQTT belum terhubung"); return; }
+      client.publish(TOPIC_MODE, "MANUAL");
+      modeStatus.textContent = "MANUAL";
+      appendLog("Set mode MANUAL");
+    });
+
+    btnKalib.addEventListener('click', () => {
+      const v = kalibInput.value.trim();
+      if (!v) return;
+      if (!client || !connected) { setWarning("MQTT belum terhubung"); return; }
+      client.publish(TOPIC_KALIB, v);
+      appendLog("Publish kalibrasi: " + v);
+    });
+
+    btnThreshold.addEventListener('click', () => {
+      const t = parseInt(thresholdInput.value);
+      if (isNaN(t) || t < 0 || t > 100) { setWarning("Threshold 0..100"); return; }
+      if (!client || !connected) { setWarning("MQTT belum terhubung"); return; }
+      client.publish(TOPIC_THRESHOLD, String(t));
+      appendLog("Publish threshold: " + t);
+    });
+
+    connectBtn.addEventListener('click', connectMQTT);
+    disconnectBtn.addEventListener('click', disconnectMQTT);
+
+    // Auto-connect on load with defaults (optional)
+    // window.addEventListener('load', () => { connectMQTT(); });
+  </script>
+</body>
+</html>
